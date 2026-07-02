@@ -1,0 +1,125 @@
+{
+  "name": "bob-jira-ext",
+  "displayName": "Jira Manager",
+  "description": "Manage Jira tickets directly from VS Code - view, create, update, and close issues",
+  "version": "0.1.0",
+  "publisher": "bob",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "jira-manager",
+          "title": "Jira",
+          "icon": "resources/jira-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "jira-manager": [
+        {
+          "id": "jiraIssues",
+          "name": "My Issues",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "jira.refresh",
+        "title": "Refresh Issues",
+        "icon": "$(refresh)",
+        "category": "Jira"
+      },
+      {
+        "command": "jira.createIssue",
+        "title": "Create Issue",
+        "icon": "$(add)",
+        "category": "Jira"
+      },
+      {
+        "command": "jira.openIssue",
+        "title": "Open Issue Details",
+        "category": "Jira"
+      },
+      {
+        "command": "jira.updateStatus",
+        "title": "Update Issue Status",
+        "category": "Jira"
+      },
+      {
+        "command": "jira.closeIssue",
+        "title": "Close Issue",
+        "category": "Jira"
+      },
+      {
+        "command": "jira.configure",
+        "title": "Configure Jira Connection",
+        "category": "Jira"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "jira.refresh",
+          "when": "view == jiraIssues",
+          "group": "navigation"
+        },
+        {
+          "command": "jira.createIssue",
+          "when": "view == jiraIssues",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Jira Manager",
+      "properties": {
+        "jira.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Jira instance base URL (e.g., https://your-domain.atlassian.net)"
+        },
+        "jira.username": {
+          "type": "string",
+          "default": "",
+          "description": "Jira username (email for Jira Cloud)"
+        },
+        "jira.project": {
+          "type": "string",
+          "default": "",
+          "description": "Default Jira project key"
+        },
+        "jira.storyPointsField": {
+          "type": "string",
+          "default": "story_points",
+          "description": "Custom field name for story points (e.g., story_points, customfield_10016, customfield_10028)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.54.0",
+    "typescript": "^5.3.2"
+  },
+  "dependencies": {
+    "node-fetch": "^2.7.0"
+  }
+}
