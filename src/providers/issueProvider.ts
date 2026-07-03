@@ -28,6 +28,9 @@ export class JiraIssueProvider implements vscode.WebviewViewProvider {
         case 'refresh':
           this.refresh();
           break;
+        case 'configure':
+          vscode.commands.executeCommand('jira.configure');
+          break;
       }
     });
 
@@ -264,21 +267,138 @@ export class JiraIssueProvider implements vscode.WebviewViewProvider {
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
+    * { box-sizing: border-box; }
     body {
-      margin: 0; padding: 24px;
+      margin: 0;
+      padding: 24px 16px;
       font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size);
       color: var(--vscode-foreground);
       background: var(--vscode-sideBar-background);
+    }
+    .welcome-logo {
+      text-align: center;
+      font-size: 40px;
+      margin-bottom: 16px;
+      line-height: 1;
+    }
+    .welcome-title {
+      text-align: center;
+      font-size: 15px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+    .welcome-sub {
+      text-align: center;
+      font-size: 12px;
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 24px;
+      line-height: 1.5;
+    }
+    .steps {
+      list-style: none;
+      padding: 0;
+      margin: 0 0 24px 0;
+    }
+    .step {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 10px 12px;
+      margin-bottom: 6px;
+      background: var(--vscode-editorWidget-background);
+      border: 1px solid var(--vscode-widget-border, transparent);
+      border-radius: 6px;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .step-num {
+      flex-shrink: 0;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: var(--vscode-textLink-foreground);
+      color: var(--vscode-editor-background);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .step-text { color: var(--vscode-foreground); }
+    .step-text strong { display: block; margin-bottom: 2px; }
+    .step-text span { color: var(--vscode-descriptionForeground); }
+    .configure-btn {
+      display: block;
+      width: 100%;
+      padding: 8px 16px;
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none;
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
       text-align: center;
     }
-    p { margin: 8px 0; color: var(--vscode-descriptionForeground); }
-    code { background: var(--vscode-textCodeBlock-background); padding: 2px 6px; border-radius: 3px; }
+    .configure-btn:hover {
+      background: var(--vscode-button-hoverBackground);
+    }
+    .hint {
+      margin-top: 14px;
+      text-align: center;
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+    }
+    code {
+      background: var(--vscode-textCodeBlock-background);
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 11px;
+    }
   </style>
 </head>
 <body>
-  <p><strong>Jira not configured</strong></p>
-  <p>Run <code>Jira: Configure Jira Connection</code> from the Command Palette to get started.</p>
+  <div class="welcome-logo">&#x1F4CB;</div>
+  <div class="welcome-title">Jira Manager</div>
+  <div class="welcome-sub">Connect your Jira workspace to manage<br>issues without leaving VS Code.</div>
+
+  <ul class="steps">
+    <li class="step">
+      <div class="step-num">1</div>
+      <div class="step-text">
+        <strong>Set your Jira URL</strong>
+        <span>e.g. https://your-domain.atlassian.net</span>
+      </div>
+    </li>
+    <li class="step">
+      <div class="step-num">2</div>
+      <div class="step-text">
+        <strong>Add your username &amp; API token</strong>
+        <span>Generate at id.atlassian.com/manage-profile/security/api-tokens</span>
+      </div>
+    </li>
+    <li class="step">
+      <div class="step-num">3</div>
+      <div class="step-text">
+        <strong>Set your default project key</strong>
+        <span>e.g. MYPROJ — issues assigned to you will appear here</span>
+      </div>
+    </li>
+  </ul>
+
+  <button class="configure-btn" onclick="configure()">Configure Jira Connection</button>
+  <div class="hint">Or run <code>Jira: Configure Jira Connection</code> from the Command Palette</div>
+
+  <script>
+    const vscode = acquireVsCodeApi();
+    function configure() {
+      vscode.postMessage({ command: 'configure' });
+    }
+  </script>
 </body>
 </html>`;
   }
