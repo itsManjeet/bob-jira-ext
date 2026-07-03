@@ -36,7 +36,16 @@ export class IssueDetailPanel {
             await this.handleToggleSubtask(message.subtaskKey, message.done);
             break;
           case 'addSubtask':
-            await this.handleAddSubtask(message.issueKey, message.summary);
+            await this.handleAddSubtask(message.issueKey, message.summary, message.priority, message.assignee);
+            break;
+          case 'editSubtaskSummary':
+            await this.handleEditSubtaskSummary(message.subtaskKey, message.summary);
+            break;
+          case 'deleteSubtask':
+            await this.handleDeleteSubtask(message.subtaskKey);
+            break;
+          case 'openSubtask':
+            vscode.commands.executeCommand('jira.openIssue', message.subtaskKey);
             break;
           case 'close':
             await this.handleClose(message.issueKey);
@@ -132,19 +141,21 @@ export class IssueDetailPanel {
     }
   }
 
-  private async handleAddSubtask(parentKey: string, summary: string) {
+  private async handleAddSubtask(parentKey: string, summary: string, priority?: string, assignee?: string) {
     try {
       const issue = this.issue;
-      // Find the subtask issue type for this project
       const subtaskType = await this.jiraService.getSubtaskIssueType(issue.fields.project.key);
-      await this.jiraService.createIssue({
-        fields: {
-          project: { key: issue.fields.project.key },
-          summary,
-          issuetype: { id: subtaskType.id },
-          parent: { key: parentKey },
-        },
-      } as any);
+      const fields: any = {
+        project: { key: issue.fields.project.key },
+        summary,
+        issuetype: { id: subtaskType.id },
+        parent: { key: parentKey },
+        assignee: { name: assignee || this.jiraService.getUsername() },
+      };
+      if (priority) {
+        fields.priority = { name: priority };
+      }
+      await this.jiraService.createIssue({ fields } as any);
       vscode.window.showInformationMessage(`Subtask added to ${parentKey}`);
       this.issue = await this.jiraService.getIssue(parentKey);
       this.update();
@@ -152,6 +163,36 @@ export class IssueDetailPanel {
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Unknown error';
       vscode.window.showErrorMessage(`Failed to create subtask: ${msg}`);
+    }
+  }
+
+  private async handleEditSubtaskSummary(subtaskKey: string, summary: string) {
+    try {
+      await this.jiraService.updateIssue(subtaskKey, { summary } as any);
+      this.issue = await this.jiraService.getIssue(this.issue.key);
+      this.update();
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      vscode.window.showErrorMessage(`Failed to update subtask: ${msg}`);
+    }
+  }
+
+  private async handleDeleteSubtask(subtaskKey: string) {
+    const confirm = await vscode.window.showWarningMessage(
+      `Delete subtask ${subtaskKey}? This cannot be undone.`,
+      { modal: true },
+      'Delete'
+    );
+    if (confirm !== 'Delete') { return; }
+    try {
+      await this.jiraService.deleteIssue(subtaskKey);
+      vscode.window.showInformationMessage(`Subtask ${subtaskKey} deleted`);
+      this.issue = await this.jiraService.getIssue(this.issue.key);
+      this.update();
+      vscode.commands.executeCommand('jira.refresh');
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      vscode.window.showErrorMessage(`Failed to delete subtask: ${msg}`);
     }
   }
 
@@ -403,10 +444,11 @@ export class IssueDetailPanel {
       margin: 0;
     }
     .subtask-item {
-      display: flex;
-      align-items: center;
+      display: grid;
+      grid-template-columns: 18px 1fr auto;
+      align-items: start;
       gap: 8px;
-      padding: 6px 0;
+      padding: 8px 0;
       border-bottom: 1px solid var(--vscode-panel-border);
       font-size: 13px;
     }
@@ -416,30 +458,80 @@ export class IssueDetailPanel {
       height: 16px;
       cursor: pointer;
       accent-color: var(--vscode-textLink-foreground);
+      margin-top: 2px;
     }
-    .subtask-item .subtask-text { flex: 1; }
-    .subtask-item .subtask-text.done {
+    .subtask-body { min-width: 0; }
+    .subtask-summary-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .subtask-text {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .subtask-text.done {
       text-decoration: line-through;
-      opacity: 0.6;
+      opacity: 0.55;
     }
-    .subtask-item .subtask-key {
+    .subtask-edit-btn {
+      opacity: 0;
+      cursor: pointer;
+      font-size: 13px;
+      flex-shrink: 0;
+      transition: opacity 0.1s;
+    }
+    .subtask-item:hover .subtask-edit-btn { opacity: 0.5; }
+    .subtask-edit-btn:hover { opacity: 1 !important; }
+    .subtask-meta {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 3px;
+      flex-wrap: wrap;
+    }
+    .subtask-key {
       font-size: 11px;
-      opacity: 0.5;
+      color: var(--vscode-textLink-foreground);
       font-family: monospace;
+      cursor: pointer;
+      text-decoration: none;
     }
-    .subtask-progress {
+    .subtask-key:hover { text-decoration: underline; }
+    .subtask-assignee {
       font-size: 11px;
       color: var(--vscode-descriptionForeground);
-      margin-top: 8px;
     }
-    .add-subtask {
-      display: flex;
-      gap: 6px;
-      margin-top: 10px;
+    .subtask-priority {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 8px;
+      font-weight: 600;
     }
-    .add-subtask input {
-      flex: 1;
-      padding: 6px 10px;
+    .subtask-priority.High, .subtask-priority.Highest { background: #7a2020; color: #fdd; }
+    .subtask-priority.Medium { background: #5c4d00; color: #ffe; }
+    .subtask-priority.Low, .subtask-priority.Lowest { background: #1a3a5c; color: #ddf; }
+    .subtask-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+    .delete-btn {
+      opacity: 0;
+      background: none;
+      border: none;
+      color: var(--vscode-errorForeground);
+      font-size: 14px;
+      cursor: pointer;
+      padding: 0 4px;
+      line-height: 1;
+      transition: opacity 0.1s;
+    }
+    .subtask-item:hover .delete-btn { opacity: 0.5; }
+    .delete-btn:hover { opacity: 1 !important; background: none; }
+    .subtask-inline-edit { display: none; }
+    .subtask-inline-edit input {
+      width: 100%;
+      padding: 4px 8px;
       border: 1px solid var(--vscode-input-border);
       background: var(--vscode-input-background);
       color: var(--vscode-input-foreground);
@@ -447,6 +539,55 @@ export class IssueDetailPanel {
       font-family: inherit;
       font-size: 12px;
     }
+    .subtask-inline-edit-btns { margin-top: 4px; display: flex; gap: 4px; }
+    .subtask-progress {
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      margin-top: 8px;
+    }
+    .add-subtask-toggle {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--vscode-textLink-foreground);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .add-subtask-toggle:hover { text-decoration: underline; }
+    .add-subtask-form {
+      display: none;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 8px;
+      padding: 10px 12px;
+      background: var(--vscode-editorWidget-background);
+      border: 1px solid var(--vscode-widget-border, transparent);
+      border-radius: 6px;
+    }
+    .add-subtask-form input, .add-subtask-form select {
+      padding: 6px 10px;
+      border: 1px solid var(--vscode-input-border);
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: 12px;
+      width: 100%;
+    }
+    .add-subtask-form select {
+      background: var(--vscode-dropdown-background);
+      color: var(--vscode-dropdown-foreground);
+    }
+    .add-subtask-form label {
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 2px;
+      display: block;
+    }
+    .add-subtask-row { display: flex; gap: 6px; }
+    .add-subtask-row > div { flex: 1; }
+    .add-subtask-actions { display: flex; gap: 6px; margin-top: 2px; }
 
     /* Shared */
     button {
@@ -516,23 +657,46 @@ export class IssueDetailPanel {
     </div>
   </div>
 
-  ${subtasks.length > 0 ? `
   <hr class="divider" />
 
   <!-- Subtasks -->
   <div class="section">
     <div class="section-header">
-      <h2>Subtasks</h2>
+      <h2>Subtasks (${subtasks.length})</h2>
     </div>
+    ${subtasks.length > 0 ? `
     <ul class="subtask-list">
       ${subtasks.map((st: any) => {
         const isDone = st.fields.status.name.toLowerCase().includes('done') ||
                        st.fields.status.name.toLowerCase().includes('closed') ||
                        st.fields.status.name.toLowerCase().includes('resolved');
-        return `<li class="subtask-item">
+        const priority: string = st.fields.priority?.name || 'Medium';
+        const assigneeName: string = st.fields.assignee?.displayName || '';
+        const priorityClass = priority.replace(/\s+/g, '');
+        return `<li class="subtask-item" id="st-${st.key}">
           <input type="checkbox" ${isDone ? 'checked' : ''} onchange="toggleSubtask('${st.key}', this.checked)" />
-          <span class="subtask-text ${isDone ? 'done' : ''}">${this.escapeHtml(st.fields.summary)}</span>
-          <span class="subtask-key">${st.key}</span>
+          <div class="subtask-body">
+            <div class="subtask-summary-row">
+              <span class="subtask-text ${isDone ? 'done' : ''}" id="st-text-${st.key}">${this.escapeHtml(st.fields.summary)}</span>
+              <span class="subtask-edit-btn" onclick="showSubtaskEdit('${st.key}')" title="Edit summary">✎</span>
+            </div>
+            <div class="subtask-inline-edit" id="st-edit-${st.key}">
+              <input type="text" id="st-input-${st.key}" value="${this.escapeHtml(st.fields.summary)}" />
+              <div class="subtask-inline-edit-btns">
+                <button onclick="saveSubtaskEdit('${st.key}')">Save</button>
+                <button class="secondary" onclick="cancelSubtaskEdit('${st.key}')">Cancel</button>
+              </div>
+            </div>
+            <div class="subtask-meta">
+              <span class="subtask-key" onclick="openSubtask('${st.key}')">${st.key}</span>
+              ${priority !== 'Medium' ? `<span class="subtask-priority ${priorityClass}">${priority}</span>` : ''}
+              ${assigneeName ? `<span class="subtask-assignee">@${this.escapeHtml(assigneeName)}</span>` : ''}
+              <span style="font-size:11px;opacity:0.5;">${st.fields.status.name}</span>
+            </div>
+          </div>
+          <div class="subtask-actions">
+            <button class="delete-btn" onclick="deleteSubtask('${st.key}')" title="Delete subtask">✕</button>
+          </div>
         </li>`;
       }).join('')}
     </ul>
@@ -545,24 +709,37 @@ export class IssueDetailPanel {
         }).length;
         return `${done} / ${total} completed`;
       })()
-    }</div>
-    <div class="add-subtask">
-      <input type="text" id="newSubtaskInput" placeholder="Add a subtask..." />
-      <button onclick="addSubtask()">Add</button>
+    }</div>` : `<div style="font-size:12px;color:var(--vscode-descriptionForeground);margin-bottom:4px;">No subtasks yet.</div>`}
+
+    <span class="add-subtask-toggle" onclick="toggleAddSubtaskForm()">＋ Add subtask</span>
+    <div class="add-subtask-form" id="addSubtaskForm">
+      <div>
+        <label>Summary *</label>
+        <input type="text" id="newSubtaskSummary" placeholder="Subtask summary..." />
+      </div>
+      <div class="add-subtask-row">
+        <div>
+          <label>Priority</label>
+          <select id="newSubtaskPriority">
+            <option value="">— default —</option>
+            <option value="Highest">Highest</option>
+            <option value="High">High</option>
+            <option value="Medium" selected>Medium</option>
+            <option value="Low">Low</option>
+            <option value="Lowest">Lowest</option>
+          </select>
+        </div>
+        <div>
+          <label>Assignee (username)</label>
+          <input type="text" id="newSubtaskAssignee" placeholder="${this.escapeHtml(this.jiraService.getUsername())}" />
+        </div>
+      </div>
+      <div class="add-subtask-actions">
+        <button onclick="addSubtask()">Create Subtask</button>
+        <button class="secondary" onclick="toggleAddSubtaskForm()">Cancel</button>
+      </div>
     </div>
   </div>
-  ` : `
-  <hr class="divider" />
-  <div class="section">
-    <div class="section-header">
-      <h2>Subtasks</h2>
-    </div>
-    <div class="add-subtask">
-      <input type="text" id="newSubtaskInput" placeholder="Add a subtask..." />
-      <button onclick="addSubtask()">Add</button>
-    </div>
-  </div>
-  `}
 
   <hr class="divider" />
 
@@ -634,13 +811,46 @@ export class IssueDetailPanel {
     function toggleSubtask(subtaskKey, done) {
       vscode.postMessage({ command: 'toggleSubtask', subtaskKey, done });
     }
-    function addSubtask() {
-      const input = document.getElementById('newSubtaskInput');
-      const summary = input.value.trim();
-      if (summary) {
-        vscode.postMessage({ command: 'addSubtask', issueKey, summary });
-        input.value = '';
+    function toggleAddSubtaskForm() {
+      const form = document.getElementById('addSubtaskForm');
+      const visible = form.style.display === 'flex';
+      form.style.display = visible ? 'none' : 'flex';
+      if (!visible) {
+        document.getElementById('newSubtaskSummary').focus();
       }
+    }
+    function addSubtask() {
+      const summary = document.getElementById('newSubtaskSummary').value.trim();
+      const priority = document.getElementById('newSubtaskPriority').value;
+      const assignee = document.getElementById('newSubtaskAssignee').value.trim();
+      if (!summary) {
+        document.getElementById('newSubtaskSummary').focus();
+        return;
+      }
+      vscode.postMessage({ command: 'addSubtask', issueKey, summary, priority: priority || undefined, assignee: assignee || undefined });
+    }
+    function showSubtaskEdit(key) {
+      document.getElementById('st-edit-' + key).style.display = 'block';
+      document.querySelector('#st-' + key + ' .subtask-summary-row').style.display = 'none';
+      const input = document.getElementById('st-input-' + key);
+      input.focus();
+      input.select();
+    }
+    function cancelSubtaskEdit(key) {
+      document.getElementById('st-edit-' + key).style.display = 'none';
+      document.querySelector('#st-' + key + ' .subtask-summary-row').style.display = 'flex';
+    }
+    function saveSubtaskEdit(key) {
+      const summary = document.getElementById('st-input-' + key).value.trim();
+      if (summary) {
+        vscode.postMessage({ command: 'editSubtaskSummary', subtaskKey: key, summary });
+      }
+    }
+    function deleteSubtask(key) {
+      vscode.postMessage({ command: 'deleteSubtask', subtaskKey: key });
+    }
+    function openSubtask(key) {
+      vscode.postMessage({ command: 'openSubtask', subtaskKey: key });
     }
 
     // Comments

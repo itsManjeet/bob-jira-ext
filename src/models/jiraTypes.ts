@@ -51,6 +51,14 @@ export interface JiraSubtask {
       name: string;
       id: string;
     };
+    priority: {
+      name: string;
+    };
+    assignee: {
+      displayName: string;
+      name: string;
+      accountId?: string;
+    } | null;
   };
 }
 

@@ -184,7 +184,18 @@ export class JiraService {
   }
 
   async getIssue(issueKey: string): Promise<JiraIssue> {
-    return this.request<JiraIssue>('GET', `/issue/${issueKey}?fields=summary,status,priority,issuetype,assignee,reporter,description,created,updated,project,labels,comment,subtasks`);
+    return this.request<JiraIssue>(
+      'GET',
+      `/issue/${issueKey}?fields=summary,status,priority,issuetype,assignee,reporter,description,created,updated,project,labels,comment,subtasks&expand=subtasks`
+    );
+  }
+
+  async getSubtaskDetails(subtaskKey: string): Promise<{ priority: { name: string }; assignee: { displayName: string; name: string; accountId?: string } | null }> {
+    const issue = await this.request<any>('GET', `/issue/${subtaskKey}?fields=priority,assignee`);
+    return {
+      priority: issue.fields.priority ?? { name: 'Medium' },
+      assignee: issue.fields.assignee ?? null,
+    };
   }
 
   async getTransitions(issueKey: string): Promise<JiraTransition[]> {
@@ -234,6 +245,10 @@ export class JiraService {
 
   async deleteIssue(issueKey: string): Promise<void> {
     await this.request<void>('DELETE', `/issue/${issueKey}`);
+  }
+
+  getUsername(): string {
+    return this.getConfig().username;
   }
 
   isConfigured(): boolean {
