@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { JiraIssue } from '../models/jiraTypes';
 import { JiraService } from '../services/jiraService';
+import { escapeAttribute, escapeHtml, getNonce, getWebviewCsp } from '../utils/webview';
 
 export class IssueDetailPanel {
   public static currentPanel: IssueDetailPanel | undefined;
@@ -32,8 +33,20 @@ export class IssueDetailPanel {
           case 'updateDescription':
             await this.handleUpdateDescription(message.issueKey, message.description);
             break;
+          case 'adjustStoryPoints':
+            await this.handleAdjustStoryPoints(message.issueKey, Number(message.delta));
+            break;
           case 'toggleSubtask':
             await this.handleToggleSubtask(message.subtaskKey, message.done);
+            break;
+          case 'updateSubtaskStatus':
+            await this.handleSubtaskStatusUpdate(message.subtaskKey);
+            break;
+          case 'assignSubtaskToMe':
+            await this.handleAssignSubtaskToMe(message.subtaskKey);
+            break;
+          case 'openIssue':
+            vscode.commands.executeCommand('jira.openIssue', message.issueKey);
             break;
           case 'addSubtask':
             await this.handleAddSubtask(message.issueKey, message.summary, message.priority, message.assignee);
@@ -141,6 +154,22 @@ export class IssueDetailPanel {
     }
   }
 
+  private async handleAdjustStoryPoints(issueKey: string, delta: number) {
+    if (!Number.isFinite(delta) || delta === 0) { return; }
+
+    try {
+      const nextPoints = Math.max(0, this.jiraService.getStoryPoints(this.issue) + delta);
+      await this.jiraService.setStoryPoints(this.issue, nextPoints);
+      vscode.window.showInformationMessage(`${issueKey} sprint points set to ${nextPoints}`);
+      this.issue = await this.jiraService.getIssue(issueKey);
+      this.update();
+      vscode.commands.executeCommand('jira.refresh');
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      vscode.window.showErrorMessage(`Failed to update sprint points: ${msg}`);
+    }
+  }
+
   private async handleAddSubtask(parentKey: string, summary: string, priority?: string, assignee?: string) {
     try {
       const issue = this.issue;
@@ -150,8 +179,10 @@ export class IssueDetailPanel {
         summary,
         issuetype: { id: subtaskType.id },
         parent: { key: parentKey },
-        assignee: { name: assignee || this.jiraService.getUsername() },
       };
+      if (assignee) {
+        fields.assignee = { name: assignee };
+      }
       if (priority) {
         fields.priority = { name: priority };
       }
@@ -228,6 +259,43 @@ export class IssueDetailPanel {
     }
   }
 
+  private async handleSubtaskStatusUpdate(subtaskKey: string) {
+    if (!subtaskKey) { return; }
+
+    try {
+      const transitions = await this.jiraService.getTransitions(subtaskKey);
+      const selected = await vscode.window.showQuickPick(
+        transitions.map((t) => ({ label: t.name, id: t.id })),
+        { placeHolder: `Move "${subtaskKey}" to...` }
+      );
+      if (!selected) { return; }
+
+      await this.jiraService.transitionIssue(subtaskKey, selected.id);
+      vscode.window.showInformationMessage(`${subtaskKey} moved to "${selected.label}"`);
+      this.issue = await this.jiraService.getIssue(this.issue.key);
+      this.update();
+      vscode.commands.executeCommand('jira.refresh');
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      vscode.window.showErrorMessage(`Failed to update subtask status: ${msg}`);
+    }
+  }
+
+  private async handleAssignSubtaskToMe(subtaskKey: string) {
+    if (!subtaskKey) { return; }
+
+    try {
+      await this.jiraService.assignIssueToCurrentUser(subtaskKey);
+      vscode.window.showInformationMessage(`${subtaskKey} assigned to you`);
+      this.issue = await this.jiraService.getIssue(this.issue.key);
+      this.update();
+      vscode.commands.executeCommand('jira.refresh');
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Unknown error';
+      vscode.window.showErrorMessage(`Failed to assign subtask: ${msg}`);
+    }
+  }
+
   private async handleClose(issueKey: string) {
     try {
       const transitions = await this.jiraService.getTransitions(issueKey);
@@ -252,6 +320,30 @@ export class IssueDetailPanel {
     }
   }
 
+  private getStatusColor(status: string): string {
+    const lower = status.toLowerCase();
+    if (lower.includes('done') || lower.includes('closed') || lower.includes('resolved')) {
+      return '#4caf50';
+    }
+    if (lower.includes('progress')) {
+      return '#ff9800';
+    }
+    if (lower.includes('review')) {
+      return '#9c27b0';
+    }
+    return '#2196f3';
+  }
+
+  private getPriorityIcon(priority: string): string {
+    const lower = priority.toLowerCase();
+    if (lower.includes('highest') || lower.includes('critical')) { return '⬆⬆'; }
+    if (lower.includes('high')) { return '⬆'; }
+    if (lower.includes('medium')) { return '—'; }
+    if (lower.includes('low')) { return '⬇'; }
+    if (lower.includes('lowest')) { return '⬇⬇'; }
+    return '—';
+  }
+
   private update() {
     this.panel.title = `Jira: ${this.issue.key}`;
     this.panel.webview.html = this.getHtml();
@@ -261,289 +353,474 @@ export class IssueDetailPanel {
     const issue = this.issue;
     const comments = issue.fields.comment?.comments || [];
     const subtasks = issue.fields.subtasks || [];
+    const storyPoints = this.jiraService.getStoryPoints(issue);
+    const statusColor = this.getStatusColor(issue.fields.status.name);
+    const priorityIcon = this.getPriorityIcon(issue.fields.priority.name);
+    const completedSubtasks = subtasks.filter((st: any) => {
+      const status = st.fields.status.name.toLowerCase();
+      return status.includes('done') || status.includes('closed') || status.includes('resolved');
+    }).length;
+    const parent = issue.fields.parent;
+    const isSubtask = Boolean(parent);
+    const nonce = getNonce();
+    const csp = getWebviewCsp(this.panel.webview, nonce);
 
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
     * { box-sizing: border-box; }
     body {
+      margin: 0;
       font-family: var(--vscode-font-family);
       font-size: var(--vscode-font-size);
       color: var(--vscode-foreground);
       background: var(--vscode-editor-background);
-      padding: 20px 24px;
-      line-height: 1.6;
-      max-width: 800px;
-      margin: 0 auto;
+      line-height: 1.55;
     }
-
-    /* Summary row */
-    .summary-row {
+    .page {
+      width: min(860px, 100%);
+      margin: 0 auto;
+      padding: 20px 24px 28px;
+    }
+    .issue-hero,
+    .section {
+      background: color-mix(in srgb, var(--vscode-editorWidget-background) 90%, transparent);
+      border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.2));
+      border-radius: 14px;
+      overflow: hidden;
+    }
+    .issue-hero {
+      padding: 16px;
+      margin-bottom: 12px;
+      border-left: 3px solid var(--vscode-textLink-foreground);
+    }
+    .hero-top {
       display: flex;
       align-items: center;
-      gap: 8px;
+      justify-content: space-between;
+      gap: 10px;
       margin-bottom: 12px;
+      min-width: 0;
+    }
+    .breadcrumb {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      margin-bottom: 10px;
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+    }
+    .breadcrumb button {
+      width: auto;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      font-size: 11px;
+    }
+    .breadcrumb button:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
+    .issue-key {
+      display: inline-flex;
+      align-items: center;
+      min-width: 0;
+      max-width: 60%;
+      padding: 3px 10px;
+      border-radius: 999px;
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .issue-project {
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .summary-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin-bottom: 14px;
+      min-width: 0;
     }
     .summary-row h1 {
       margin: 0;
-      font-size: 1.3em;
+      font-size: 1.45em;
       flex: 1;
-      line-height: 1.3;
+      line-height: 1.25;
+      min-width: 0;
     }
-    .summary-row .edit-btn {
-      opacity: 0.5;
+    .edit-btn {
+      opacity: 0.55;
       cursor: pointer;
-      font-size: 16px;
       flex-shrink: 0;
+      border-radius: 8px;
+      padding: 2px 5px;
+      color: var(--vscode-descriptionForeground);
     }
-    .summary-row .edit-btn:hover { opacity: 1; }
-    .summary-input {
+    .edit-btn:hover {
+      opacity: 1;
+      background: var(--vscode-toolbar-hoverBackground);
+      color: var(--vscode-foreground);
+    }
+    [data-action] { cursor: pointer; }
+    .summary-input,
+    .desc-edit,
+    .subtask-inline-edit {
       display: none;
-      flex: 1;
     }
-    .summary-input input {
+    input,
+    textarea,
+    select {
       width: 100%;
-      padding: 6px 10px;
-      font-size: 1.3em;
-      font-weight: 700;
-      border: 1px solid var(--vscode-input-border);
+      border: 1px solid var(--vscode-input-border, transparent);
       background: var(--vscode-input-background);
       color: var(--vscode-input-foreground);
-      border-radius: 4px;
+      border-radius: 8px;
       font-family: inherit;
+      font-size: inherit;
     }
-    .summary-input button {
-      margin-top: 6px;
-      margin-right: 4px;
+    input { padding: 7px 10px; }
+    textarea {
+      padding: 10px;
+      resize: vertical;
+    }
+    .summary-input input {
+      font-size: 1.25em;
+      font-weight: 700;
+    }
+    .inline-actions,
+    .summary-input,
+    .desc-edit {
+      margin-top: 8px;
+    }
+    .summary-input button,
+    .desc-edit button,
+    .comment-form button {
+      margin-top: 8px;
+      margin-right: 6px;
     }
 
-    /* Pills bar */
-    .pills-bar {
+    .hero-meta,
+    .card-meta {
       display: flex;
       align-items: center;
       gap: 8px;
       flex-wrap: wrap;
-      margin-bottom: 16px;
+      min-width: 0;
     }
-    .pill {
+    .hero-meta { justify-content: flex-start; }
+    .meta-pill {
       display: inline-flex;
       align-items: center;
-      padding: 3px 10px;
-      border-radius: 12px;
+      gap: 6px;
+      min-width: 0;
+      max-width: 100%;
+      padding: 3px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.2));
+      background: color-mix(in srgb, var(--vscode-editorWidget-background) 62%, transparent);
+      color: var(--vscode-descriptionForeground);
       font-size: 11px;
       font-weight: 600;
-      background: var(--vscode-badge-background);
+      line-height: 1.5;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .status-pill {
+      color: var(--vscode-foreground);
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .status-button {
+      width: auto;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--vscode-editorWidget-background) 62%, transparent);
+      color: var(--vscode-foreground);
+      padding: 3px 9px;
+      font-size: 11px;
+    }
+    .status-button:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
+    .points-control {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      flex-shrink: 0;
+      margin-left: auto;
+      padding: 3px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--vscode-editor-background) 70%, transparent);
+      border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.2));
+    }
+    .points-label {
+      min-width: 58px;
+      height: 24px;
+      padding: 0 10px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       color: var(--vscode-badge-foreground);
-    }
-    .pill.priority { background: #5c4d9a; color: #e8e0ff; }
-    .pill.project { background: #1a6b47; color: #d4f5e6; }
-    .pill.type { background: #4a4a4a; color: #ddd; }
-    .status-select {
-      padding: 3px 8px;
-      border-radius: 12px;
+      background: var(--vscode-badge-background);
+      border-radius: 999px;
       font-size: 11px;
-      font-weight: 600;
-      border: 1px solid var(--vscode-input-border);
-      background: var(--vscode-dropdown-background);
-      color: var(--vscode-dropdown-foreground);
-      cursor: pointer;
-      appearance: none;
-      -webkit-appearance: none;
-      padding-right: 20px;
-      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23888'/%3E%3C/svg%3E");
-      background-repeat: no-repeat;
-      background-position: right 6px center;
+      font-weight: 700;
+      white-space: nowrap;
     }
+    .points-btn {
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      border-radius: 999px;
+      font-size: 15px;
+      line-height: 1;
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .points-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
 
-    /* Description section */
     .section {
-      margin-bottom: 20px;
+      margin-bottom: 12px;
+      padding: 14px;
     }
     .section-header {
       display: flex;
       align-items: center;
+      justify-content: space-between;
       gap: 8px;
-      margin-bottom: 8px;
+      margin-bottom: 10px;
     }
     .section-header h2 {
       margin: 0;
-      font-size: 0.9em;
+      font-size: 0.82em;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
-      opacity: 0.7;
+      letter-spacing: 0.08em;
+      color: var(--vscode-descriptionForeground);
     }
-    .section-header .edit-btn {
-      opacity: 0.4;
-      cursor: pointer;
-      font-size: 14px;
+    .section-count {
+      color: var(--vscode-descriptionForeground);
+      font-size: 11px;
+      font-weight: 600;
     }
-    .section-header .edit-btn:hover { opacity: 1; }
     .description {
       white-space: pre-wrap;
       padding: 12px;
-      border-radius: 6px;
-      background: var(--vscode-textBlockQuote-background);
-      border-left: 3px solid var(--vscode-textBlockQuote-border);
+      border-radius: 10px;
+      background: color-mix(in srgb, var(--vscode-editor-background) 72%, transparent);
+      border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.16));
       font-size: 13px;
+      color: var(--vscode-foreground);
     }
-    .desc-edit {
-      display: none;
-    }
-    .desc-edit textarea {
-      width: 100%;
-      min-height: 120px;
-      padding: 10px;
-      border: 1px solid var(--vscode-input-border);
-      background: var(--vscode-input-background);
-      color: var(--vscode-input-foreground);
-      border-radius: 4px;
-      font-family: inherit;
-      font-size: inherit;
-      resize: vertical;
-    }
-    .desc-edit button { margin-top: 6px; margin-right: 4px; }
 
-    /* Comments */
-    .comment {
-      margin-bottom: 10px;
-      padding: 10px 12px;
-      background: var(--vscode-editorWidget-background);
-      border-radius: 6px;
-      border: 1px solid var(--vscode-widget-border, transparent);
-    }
-    .comment-header {
-      display: flex;
-      align-items: baseline;
-      gap: 8px;
-      margin-bottom: 4px;
-    }
-    .comment-author { font-weight: 600; font-size: 12px; }
-    .comment-date { font-size: 11px; opacity: 0.6; }
-    .comment-body { font-size: 13px; white-space: pre-wrap; }
-    .comment-form textarea {
-      width: 100%;
-      min-height: 70px;
-      padding: 10px;
-      border: 1px solid var(--vscode-input-border);
-      background: var(--vscode-input-background);
-      color: var(--vscode-input-foreground);
-      border-radius: 4px;
-      font-family: inherit;
-      font-size: inherit;
-      resize: vertical;
-    }
-    .comment-form button { margin-top: 6px; }
-
-    /* Subtasks */
     .subtask-list {
       list-style: none;
       padding: 0;
       margin: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
     }
     .subtask-item {
-      display: grid;
-      grid-template-columns: 18px 1fr auto;
-      align-items: start;
+      display: flex;
+      flex-direction: column;
       gap: 8px;
-      padding: 8px 0;
-      border-bottom: 1px solid var(--vscode-panel-border);
+      padding: 11px 12px;
+      border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.16));
+      border-radius: 10px;
+      background: color-mix(in srgb, var(--vscode-editor-background) 72%, transparent);
       font-size: 13px;
+      transition: border-color 0.12s ease, background 0.12s ease, transform 0.12s ease;
     }
-    .subtask-item:last-child { border-bottom: none; }
+    .subtask-item:hover {
+      border-color: var(--vscode-focusBorder);
+      background: var(--vscode-list-hoverBackground);
+      transform: translateY(-1px);
+    }
+    .subtask-top,
+    .subtask-title-row,
+    .subtask-bottom {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .subtask-top,
+    .subtask-bottom { justify-content: space-between; }
+    .subtask-identity,
+    .subtask-meta,
+    .subtask-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+    .subtask-key {
+      display: inline-flex;
+      align-items: center;
+      min-width: 0;
+      max-width: 160px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.2));
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      cursor: pointer;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .subtask-key:hover { filter: brightness(1.1); }
+    .subtask-type,
+    .subtask-assignee {
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      white-space: nowrap;
+    }
+    .subtask-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.2));
+      background: color-mix(in srgb, var(--vscode-editorWidget-background) 62%, transparent);
+      color: var(--vscode-foreground);
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.5;
+      max-width: 180px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .subtask-status-button {
+      cursor: pointer;
+    }
+    .subtask-status-button:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
     .subtask-item input[type="checkbox"] {
       width: 16px;
       height: 16px;
       cursor: pointer;
       accent-color: var(--vscode-textLink-foreground);
-      margin-top: 2px;
+      flex-shrink: 0;
     }
-    .subtask-body { min-width: 0; }
-    .subtask-summary-row {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
+    .subtask-body { min-width: 0; flex: 1; }
+    .subtask-summary-row { min-width: 0; flex: 1; }
     .subtask-text {
-      flex: 1;
+      display: block;
       min-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      font-weight: 600;
+      line-height: 1.35;
     }
     .subtask-text.done {
       text-decoration: line-through;
       opacity: 0.55;
     }
-    .subtask-edit-btn {
-      opacity: 0;
-      cursor: pointer;
-      font-size: 13px;
-      flex-shrink: 0;
-      transition: opacity 0.1s;
-    }
-    .subtask-item:hover .subtask-edit-btn { opacity: 0.5; }
-    .subtask-edit-btn:hover { opacity: 1 !important; }
-    .subtask-meta {
-      display: flex;
+    .subtask-edit-btn,
+    .subtask-open-btn,
+    .assign-self-btn,
+    .delete-btn {
+      min-width: 24px;
+      height: 24px;
+      padding: 0 8px;
+      border-radius: 999px;
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      display: inline-flex;
       align-items: center;
-      gap: 6px;
-      margin-top: 3px;
-      flex-wrap: wrap;
-    }
-    .subtask-key {
+      justify-content: center;
       font-size: 11px;
-      color: var(--vscode-textLink-foreground);
-      font-family: monospace;
-      cursor: pointer;
-      text-decoration: none;
+      line-height: 1;
+      opacity: 0.86;
+      white-space: nowrap;
     }
-    .subtask-key:hover { text-decoration: underline; }
-    .subtask-assignee {
-      font-size: 11px;
-      color: var(--vscode-descriptionForeground);
+    .subtask-edit-btn,
+    .subtask-open-btn,
+    .delete-btn {
+      width: 24px;
+      padding: 0;
+    }
+    .subtask-edit-btn:hover,
+    .subtask-open-btn:hover,
+    .assign-self-btn:hover {
+      opacity: 1;
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
+    .delete-btn {
+      color: var(--vscode-errorForeground);
+      background: transparent;
+      border-color: transparent;
+    }
+    .delete-btn:hover {
+      background: var(--vscode-toolbar-hoverBackground);
     }
     .subtask-priority {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
       font-size: 10px;
-      padding: 1px 6px;
-      border-radius: 8px;
-      font-weight: 600;
+      padding: 2px 7px;
+      border-radius: 999px;
+      border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.2));
+      color: var(--vscode-descriptionForeground);
+      white-space: nowrap;
     }
-    .subtask-priority.High, .subtask-priority.Highest { background: #7a2020; color: #fdd; }
-    .subtask-priority.Medium { background: #5c4d00; color: #ffe; }
-    .subtask-priority.Low, .subtask-priority.Lowest { background: #1a3a5c; color: #ddf; }
-    .subtask-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
-    .delete-btn {
-      opacity: 0;
-      background: none;
-      border: none;
-      color: var(--vscode-errorForeground);
-      font-size: 14px;
-      cursor: pointer;
-      padding: 0 4px;
-      line-height: 1;
-      transition: opacity 0.1s;
+    .subtask-inline-edit {
+      margin-top: 8px;
+      padding: 10px;
+      border-radius: 10px;
+      border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.16));
+      background: color-mix(in srgb, var(--vscode-editorWidget-background) 70%, transparent);
     }
-    .subtask-item:hover .delete-btn { opacity: 0.5; }
-    .delete-btn:hover { opacity: 1 !important; background: none; }
-    .subtask-inline-edit { display: none; }
-    .subtask-inline-edit input {
-      width: 100%;
-      padding: 4px 8px;
-      border: 1px solid var(--vscode-input-border);
-      background: var(--vscode-input-background);
-      color: var(--vscode-input-foreground);
-      border-radius: 4px;
-      font-family: inherit;
-      font-size: 12px;
-    }
-    .subtask-inline-edit-btns { margin-top: 4px; display: flex; gap: 4px; }
+    .subtask-inline-edit input { font-size: 12px; }
+    .subtask-inline-edit-btns { margin-top: 8px; display: flex; gap: 6px; }
     .subtask-progress {
+      display: inline-flex;
+      align-items: center;
+      padding: 3px 9px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--vscode-editor-background) 72%, transparent);
+      border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.16));
       font-size: 11px;
       color: var(--vscode-descriptionForeground);
-      margin-top: 8px;
+      margin-top: 10px;
+    }
+    .empty-note {
+      font-size: 12px;
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 8px;
     }
     .add-subtask-toggle {
       margin-top: 10px;
@@ -553,231 +830,282 @@ export class IssueDetailPanel {
       display: inline-flex;
       align-items: center;
       gap: 4px;
+      border-radius: 8px;
+      padding: 4px 0;
     }
     .add-subtask-toggle:hover { text-decoration: underline; }
     .add-subtask-form {
       display: none;
       flex-direction: column;
-      gap: 6px;
+      gap: 8px;
       margin-top: 8px;
-      padding: 10px 12px;
-      background: var(--vscode-editorWidget-background);
-      border: 1px solid var(--vscode-widget-border, transparent);
-      border-radius: 6px;
-    }
-    .add-subtask-form input, .add-subtask-form select {
-      padding: 6px 10px;
-      border: 1px solid var(--vscode-input-border);
-      background: var(--vscode-input-background);
-      color: var(--vscode-input-foreground);
-      border-radius: 4px;
-      font-family: inherit;
-      font-size: 12px;
-      width: 100%;
+      padding: 12px;
+      background: color-mix(in srgb, var(--vscode-editor-background) 72%, transparent);
+      border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.16));
+      border-radius: 10px;
     }
     .add-subtask-form select {
       background: var(--vscode-dropdown-background);
       color: var(--vscode-dropdown-foreground);
+      padding: 7px 10px;
     }
     .add-subtask-form label {
       font-size: 11px;
       color: var(--vscode-descriptionForeground);
-      margin-bottom: 2px;
+      margin-bottom: 3px;
       display: block;
     }
-    .add-subtask-row { display: flex; gap: 6px; }
-    .add-subtask-row > div { flex: 1; }
+    .add-subtask-row { display: flex; gap: 8px; }
+    .add-subtask-row > div { flex: 1; min-width: 0; }
     .add-subtask-actions { display: flex; gap: 6px; margin-top: 2px; }
 
-    /* Shared */
+    .comment-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .comment {
+      padding: 10px 12px;
+      background: color-mix(in srgb, var(--vscode-editor-background) 72%, transparent);
+      border-radius: 10px;
+      border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.16));
+    }
+    .comment-header {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      margin-bottom: 5px;
+    }
+    .comment-author { font-weight: 700; font-size: 12px; }
+    .comment-date { font-size: 11px; color: var(--vscode-descriptionForeground); }
+    .comment-body { font-size: 13px; white-space: pre-wrap; }
+    .comment-form textarea { min-height: 74px; }
+
     button {
-      padding: 5px 12px;
-      border: none;
-      border-radius: 4px;
+      border: 1px solid transparent;
+      border-radius: 8px;
       cursor: pointer;
+      font-family: inherit;
       font-size: 12px;
+      font-weight: 600;
       background: var(--vscode-button-background);
       color: var(--vscode-button-foreground);
+      padding: 6px 12px;
     }
     button:hover { background: var(--vscode-button-hoverBackground); }
+    button:focus-visible,
+    input:focus-visible,
+    textarea:focus-visible,
+    [data-action]:focus-visible {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 2px;
+    }
     button.secondary {
       background: var(--vscode-button-secondaryBackground);
       color: var(--vscode-button-secondaryForeground);
     }
 
-    .key-label {
-      font-size: 12px;
-      opacity: 0.6;
-      margin-bottom: 4px;
-    }
-    .divider {
-      border: none;
-      border-top: 1px solid var(--vscode-panel-border);
-      margin: 16px 0;
+    @media (max-width: 560px) {
+      .page { padding: 12px; }
+      .issue-hero,
+      .section { border-radius: 10px; }
+      .summary-row h1 { font-size: 1.25em; }
+      .hero-meta { align-items: stretch; }
+      .points-control { width: 100%; justify-content: space-between; margin-left: 0; }
+      .subtask-top, .subtask-bottom { align-items: flex-start; }
+      .subtask-actions { margin-left: auto; }
+      .add-subtask-row { flex-direction: column; }
     }
   </style>
 </head>
-<body>
-  <div class="key-label">${issue.key}</div>
+<body data-issue-key="${escapeAttribute(issue.key)}">
+  <main class="page">
+    <article class="issue-hero">
+      ${isSubtask && parent ? `
+      <div class="breadcrumb">
+        <span>Subtask of</span>
+        <button type="button" data-action="openIssue" data-issue-key="${escapeAttribute(parent.key)}" title="Open parent issue">${escapeHtml(parent.key)}</button>
+        ${parent.fields?.summary ? `<span>${escapeHtml(parent.fields.summary)}</span>` : ''}
+      </div>` : ''}
+      <div class="hero-top">
+        <span class="issue-key">${escapeHtml(issue.key)}</span>
+        <span class="issue-project">${escapeHtml(issue.fields.project.key)} · ${escapeHtml(issue.fields.project.name)}</span>
+      </div>
 
-  <!-- Summary -->
-  <div class="summary-row" id="summaryDisplay">
-    <h1 id="summaryText">${this.escapeHtml(issue.fields.summary)}</h1>
-    <span class="edit-btn" onclick="showSummaryEdit()" title="Edit summary">✎</span>
-  </div>
-  <div class="summary-input" id="summaryEdit">
-    <input type="text" id="summaryInput" value="${this.escapeHtml(issue.fields.summary)}" />
-    <button onclick="saveSummary()">Save</button>
-    <button class="secondary" onclick="cancelSummaryEdit()">Cancel</button>
-  </div>
+      <div class="summary-row" id="summaryDisplay">
+        <h1 id="summaryText">${escapeHtml(issue.fields.summary)}</h1>
+        <span class="edit-btn" data-action="showSummaryEdit" title="Edit summary" tabindex="0">✎</span>
+      </div>
+      <div class="summary-input" id="summaryEdit">
+        <input type="text" id="summaryInput" value="${escapeAttribute(issue.fields.summary)}" />
+        <button type="button" data-action="saveSummary">Save</button>
+        <button class="secondary" type="button" data-action="cancelSummaryEdit">Cancel</button>
+      </div>
 
-  <!-- Status & Pills -->
-  <div class="pills-bar">
-    <select class="status-select" onchange="changeStatus(this.value)" id="statusSelect">
-      <option selected disabled>${issue.fields.status.name}</option>
-    </select>
-    <span class="pill priority"># ${issue.fields.priority.name}</span>
-    <span class="pill project"># ${issue.fields.project.key}</span>
-    <span class="pill type">${issue.fields.issuetype.name}</span>
-  </div>
+      <div class="hero-meta">
+        <button class="meta-pill status-pill status-button" type="button" data-action="changeStatus" title="Change status">
+          <span class="status-dot" style="background:${statusColor};"></span>
+          ${escapeHtml(issue.fields.status.name)}
+        </button>
+        <span class="meta-pill">${escapeHtml(priorityIcon)} ${escapeHtml(issue.fields.priority.name)}</span>
+        <span class="meta-pill">${escapeHtml(issue.fields.issuetype.name)}</span>
+        <span class="points-control" aria-label="Sprint points assigned">
+          <button class="points-btn" type="button" data-action="adjustStoryPoints" data-delta="-1" title="Decrease sprint points" aria-label="Decrease sprint points">−</button>
+          <span class="points-label">${escapeHtml(storyPoints)} pts</span>
+          <button class="points-btn" type="button" data-action="adjustStoryPoints" data-delta="1" title="Increase sprint points" aria-label="Increase sprint points">+</button>
+        </span>
+      </div>
+    </article>
 
-  <hr class="divider" />
+    <section class="section">
+      <div class="section-header">
+        <h2>Description</h2>
+        <span class="edit-btn" data-action="showDescEdit" title="Edit description" tabindex="0">✎</span>
+      </div>
+      <div class="description" id="descDisplay">${issue.fields.description ? escapeHtml(issue.fields.description) : '<span class="empty-note">No description</span>'}</div>
+      <div class="desc-edit" id="descEdit">
+        <textarea id="descInput">${issue.fields.description ? escapeHtml(issue.fields.description) : ''}</textarea>
+        <button type="button" data-action="saveDescription">Save</button>
+        <button class="secondary" type="button" data-action="cancelDescEdit">Cancel</button>
+      </div>
+    </section>
 
-  <!-- Description -->
-  <div class="section">
-    <div class="section-header">
-      <h2>Description</h2>
-      <span class="edit-btn" onclick="showDescEdit()" title="Edit description">✎</span>
-    </div>
-    <div class="description" id="descDisplay">${issue.fields.description ? this.escapeHtml(issue.fields.description) : '<em style="opacity:0.5;">No description</em>'}</div>
-    <div class="desc-edit" id="descEdit">
-      <textarea id="descInput">${issue.fields.description ? this.escapeHtml(issue.fields.description) : ''}</textarea>
-      <button onclick="saveDescription()">Save</button>
-      <button class="secondary" onclick="cancelDescEdit()">Cancel</button>
-    </div>
-  </div>
-
-  <hr class="divider" />
-
-  <!-- Subtasks -->
-  <div class="section">
-    <div class="section-header">
-      <h2>Subtasks (${subtasks.length})</h2>
-    </div>
-    ${subtasks.length > 0 ? `
-    <ul class="subtask-list">
-      ${subtasks.map((st: any) => {
-        const isDone = st.fields.status.name.toLowerCase().includes('done') ||
-                       st.fields.status.name.toLowerCase().includes('closed') ||
-                       st.fields.status.name.toLowerCase().includes('resolved');
-        const priority: string = st.fields.priority?.name || 'Medium';
-        const assigneeName: string = st.fields.assignee?.displayName || '';
-        const priorityClass = priority.replace(/\s+/g, '');
-        return `<li class="subtask-item" id="st-${st.key}">
-          <input type="checkbox" ${isDone ? 'checked' : ''} onchange="toggleSubtask('${st.key}', this.checked)" />
-          <div class="subtask-body">
-            <div class="subtask-summary-row">
-              <span class="subtask-text ${isDone ? 'done' : ''}" id="st-text-${st.key}">${this.escapeHtml(st.fields.summary)}</span>
-              <span class="subtask-edit-btn" onclick="showSubtaskEdit('${st.key}')" title="Edit summary">✎</span>
+    ${!isSubtask ? `
+    <section class="section">
+      <div class="section-header">
+        <h2>Subtasks</h2>
+        <span class="section-count">${completedSubtasks} / ${subtasks.length} done</span>
+      </div>
+      ${subtasks.length > 0 ? `
+      <ul class="subtask-list">
+        ${subtasks.map((st: any) => {
+          const isDone = st.fields.status.name.toLowerCase().includes('done') ||
+                         st.fields.status.name.toLowerCase().includes('closed') ||
+                         st.fields.status.name.toLowerCase().includes('resolved');
+          const priority: string = st.fields.priority?.name || 'Medium';
+          const assigneeName: string = st.fields.assignee?.displayName || '';
+          const isUnassigned = !st.fields.assignee;
+          const priorityClass = `priority-${priority.toLowerCase().replace(/[^a-z0-9_-]+/g, '-')}`;
+          const subtaskStatusColor = this.getStatusColor(st.fields.status.name);
+          return `<li class="subtask-item" id="st-${escapeAttribute(st.key)}">
+            <div class="subtask-top">
+              <div class="subtask-identity">
+                <span class="subtask-key" data-action="openSubtask" data-subtask-key="${escapeAttribute(st.key)}" title="Open ${escapeAttribute(st.key)}">${escapeHtml(st.key)}</span>
+                <span class="subtask-type">Sub-task</span>
+              </div>
+              <span class="subtask-status subtask-status-button" data-action="updateSubtaskStatus" data-subtask-key="${escapeAttribute(st.key)}" title="Change status">
+                <span class="status-dot" style="background:${subtaskStatusColor};"></span>${escapeHtml(st.fields.status.name)}
+              </span>
             </div>
-            <div class="subtask-inline-edit" id="st-edit-${st.key}">
-              <input type="text" id="st-input-${st.key}" value="${this.escapeHtml(st.fields.summary)}" />
-              <div class="subtask-inline-edit-btns">
-                <button onclick="saveSubtaskEdit('${st.key}')">Save</button>
-                <button class="secondary" onclick="cancelSubtaskEdit('${st.key}')">Cancel</button>
+            <div class="subtask-title-row">
+              <input type="checkbox" ${isDone ? 'checked' : ''} data-action="toggleSubtask" data-subtask-key="${escapeAttribute(st.key)}" aria-label="Toggle ${escapeAttribute(st.key)}" />
+              <div class="subtask-body">
+                <div class="subtask-summary-row">
+                  <span class="subtask-text ${isDone ? 'done' : ''}" id="st-text-${escapeAttribute(st.key)}">${escapeHtml(st.fields.summary)}</span>
+                </div>
+                <div class="subtask-inline-edit" id="st-edit-${escapeAttribute(st.key)}">
+                  <input type="text" id="st-input-${escapeAttribute(st.key)}" value="${escapeAttribute(st.fields.summary)}" />
+                  <div class="subtask-inline-edit-btns">
+                    <button type="button" data-action="saveSubtaskEdit" data-subtask-key="${escapeAttribute(st.key)}">Save</button>
+                    <button class="secondary" type="button" data-action="cancelSubtaskEdit" data-subtask-key="${escapeAttribute(st.key)}">Cancel</button>
+                  </div>
+                </div>
               </div>
             </div>
-            <div class="subtask-meta">
-              <span class="subtask-key" onclick="openSubtask('${st.key}')">${st.key}</span>
-              ${priority !== 'Medium' ? `<span class="subtask-priority ${priorityClass}">${priority}</span>` : ''}
-              ${assigneeName ? `<span class="subtask-assignee">@${this.escapeHtml(assigneeName)}</span>` : ''}
-              <span style="font-size:11px;opacity:0.5;">${st.fields.status.name}</span>
+            <div class="subtask-bottom">
+              <div class="subtask-meta">
+                <span class="subtask-priority ${escapeAttribute(priorityClass)}">${escapeHtml(priority)}</span>
+                ${assigneeName ? `<span class="subtask-assignee">@${escapeHtml(assigneeName)}</span>` : '<span class="subtask-assignee">Unassigned</span>'}
+              </div>
+              <div class="subtask-actions">
+                ${isUnassigned ? `<button class="assign-self-btn" type="button" data-action="assignSubtaskToMe" data-subtask-key="${escapeAttribute(st.key)}" title="Assign subtask to me">Assign to me</button>` : ''}
+                <button class="subtask-open-btn" type="button" data-action="openSubtask" data-subtask-key="${escapeAttribute(st.key)}" title="Open full subtask page for description and comments">↗</button>
+                <button class="subtask-edit-btn" type="button" data-action="showSubtaskEdit" data-subtask-key="${escapeAttribute(st.key)}" title="Edit summary">✎</button>
+                <button class="delete-btn" type="button" data-action="deleteSubtask" data-subtask-key="${escapeAttribute(st.key)}" title="Delete subtask">✕</button>
+              </div>
             </div>
-          </div>
-          <div class="subtask-actions">
-            <button class="delete-btn" onclick="deleteSubtask('${st.key}')" title="Delete subtask">✕</button>
-          </div>
-        </li>`;
-      }).join('')}
-    </ul>
-    <div class="subtask-progress">${
-      (() => {
-        const total = subtasks.length;
-        const done = subtasks.filter((st: any) => {
-          const s = st.fields.status.name.toLowerCase();
-          return s.includes('done') || s.includes('closed') || s.includes('resolved');
-        }).length;
-        return `${done} / ${total} completed`;
-      })()
-    }</div>` : `<div style="font-size:12px;color:var(--vscode-descriptionForeground);margin-bottom:4px;">No subtasks yet.</div>`}
+          </li>`;
+        }).join('')}
+      </ul>
+      <div class="subtask-progress">${completedSubtasks} / ${subtasks.length} completed</div>` : `<div class="empty-note">No subtasks yet.</div>`}
 
-    <span class="add-subtask-toggle" onclick="toggleAddSubtaskForm()">＋ Add subtask</span>
-    <div class="add-subtask-form" id="addSubtaskForm">
-      <div>
-        <label>Summary *</label>
-        <input type="text" id="newSubtaskSummary" placeholder="Subtask summary..." />
-      </div>
-      <div class="add-subtask-row">
+      <span class="add-subtask-toggle" data-action="toggleAddSubtaskForm">＋ Add subtask</span>
+      <div class="add-subtask-form" id="addSubtaskForm">
         <div>
-          <label>Priority</label>
-          <select id="newSubtaskPriority">
-            <option value="">— default —</option>
-            <option value="Highest">Highest</option>
-            <option value="High">High</option>
-            <option value="Medium" selected>Medium</option>
-            <option value="Low">Low</option>
-            <option value="Lowest">Lowest</option>
-          </select>
+          <label>Summary *</label>
+          <input type="text" id="newSubtaskSummary" placeholder="Subtask summary..." />
         </div>
-        <div>
-          <label>Assignee (username)</label>
-          <input type="text" id="newSubtaskAssignee" placeholder="${this.escapeHtml(this.jiraService.getUsername())}" />
+        <div class="add-subtask-row">
+          <div>
+            <label>Priority</label>
+            <select id="newSubtaskPriority">
+              <option value="">— default —</option>
+              <option value="Highest">Highest</option>
+              <option value="High">High</option>
+              <option value="Medium" selected>Medium</option>
+              <option value="Low">Low</option>
+              <option value="Lowest">Lowest</option>
+            </select>
+          </div>
+          <div>
+            <label>Assignee (optional)</label>
+            <input type="text" id="newSubtaskAssignee" placeholder="Leave blank for unassigned" />
+          </div>
+        </div>
+        <div class="add-subtask-actions">
+          <button type="button" data-action="addSubtask">Create Subtask</button>
+          <button class="secondary" type="button" data-action="toggleAddSubtaskForm">Cancel</button>
         </div>
       </div>
-      <div class="add-subtask-actions">
-        <button onclick="addSubtask()">Create Subtask</button>
-        <button class="secondary" onclick="toggleAddSubtaskForm()">Cancel</button>
+    </section>` : ''}
+
+    <section class="section">
+      <div class="section-header">
+        <h2>Comments</h2>
+        <span class="section-count">${comments.length}</span>
       </div>
-    </div>
-  </div>
+      ${comments.length > 0 ? `<div class="comment-list">
+        ${comments.map((c) => `
+          <div class="comment">
+            <div class="comment-header">
+              <span class="comment-author">${escapeHtml(c.author.displayName)}</span>
+              <span class="comment-date">${escapeHtml(new Date(c.created).toLocaleString())}</span>
+            </div>
+            <div class="comment-body">${escapeHtml(c.body)}</div>
+          </div>`).join('')}
+      </div>` : `<div class="empty-note">No comments yet.</div>`}
+      <div class="comment-form">
+        <textarea id="commentBody" placeholder="Write a comment..."></textarea>
+        <button type="button" data-action="addComment">Add Comment</button>
+      </div>
+    </section>
+  </main>
 
-  <hr class="divider" />
-
-  <!-- Comments -->
-  <div class="section">
-    <div class="section-header">
-      <h2>Comments (${comments.length})</h2>
-    </div>
-    ${comments.map((c) => `
-      <div class="comment">
-        <div class="comment-header">
-          <span class="comment-author">${c.author.displayName}</span>
-          <span class="comment-date">${new Date(c.created).toLocaleString()}</span>
-        </div>
-        <div class="comment-body">${this.escapeHtml(c.body)}</div>
-      </div>`).join('')}
-    <div class="comment-form">
-      <textarea id="commentBody" placeholder="Write a comment..."></textarea>
-      <button onclick="addComment()">Add Comment</button>
-    </div>
-  </div>
-
-  <script>
+  <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    const issueKey = '${issue.key}';
+    const issueKey = document.body.dataset.issueKey;
+
+    function requireElement(id) {
+      const element = document.getElementById(id);
+      if (!element) {
+        throw new Error('Missing element: ' + id);
+      }
+      return element;
+    }
 
     // Summary edit
     function showSummaryEdit() {
-      document.getElementById('summaryDisplay').style.display = 'none';
-      document.getElementById('summaryEdit').style.display = 'block';
-      document.getElementById('summaryInput').focus();
+      requireElement('summaryDisplay').style.display = 'none';
+      requireElement('summaryEdit').style.display = 'block';
+      requireElement('summaryInput').focus();
     }
     function cancelSummaryEdit() {
-      document.getElementById('summaryDisplay').style.display = 'flex';
-      document.getElementById('summaryEdit').style.display = 'none';
+      requireElement('summaryDisplay').style.display = 'flex';
+      requireElement('summaryEdit').style.display = 'none';
     }
     function saveSummary() {
-      const summary = document.getElementById('summaryInput').value.trim();
+      const summary = requireElement('summaryInput').value.trim();
       if (summary) {
         vscode.postMessage({ command: 'updateSummary', issueKey, summary });
       }
@@ -787,24 +1115,25 @@ export class IssueDetailPanel {
     function changeStatus() {
       vscode.postMessage({ command: 'updateStatus', issueKey });
     }
-    document.getElementById('statusSelect').addEventListener('mousedown', function(e) {
-      e.preventDefault();
-      changeStatus();
-    });
-
     // Description edit
     function showDescEdit() {
-      document.getElementById('descDisplay').style.display = 'none';
-      document.getElementById('descEdit').style.display = 'block';
-      document.getElementById('descInput').focus();
+      requireElement('descDisplay').style.display = 'none';
+      requireElement('descEdit').style.display = 'block';
+      requireElement('descInput').focus();
     }
     function cancelDescEdit() {
-      document.getElementById('descDisplay').style.display = 'block';
-      document.getElementById('descEdit').style.display = 'none';
+      requireElement('descDisplay').style.display = 'block';
+      requireElement('descEdit').style.display = 'none';
     }
     function saveDescription() {
-      const description = document.getElementById('descInput').value;
+      const description = requireElement('descInput').value;
       vscode.postMessage({ command: 'updateDescription', issueKey, description });
+    }
+
+    // Sprint points
+    function adjustStoryPoints(delta) {
+      if (!Number.isFinite(delta) || delta === 0) { return; }
+      vscode.postMessage({ command: 'adjustStoryPoints', issueKey, delta });
     }
 
     // Subtasks
@@ -812,36 +1141,38 @@ export class IssueDetailPanel {
       vscode.postMessage({ command: 'toggleSubtask', subtaskKey, done });
     }
     function toggleAddSubtaskForm() {
-      const form = document.getElementById('addSubtaskForm');
+      const form = requireElement('addSubtaskForm');
       const visible = form.style.display === 'flex';
       form.style.display = visible ? 'none' : 'flex';
       if (!visible) {
-        document.getElementById('newSubtaskSummary').focus();
+        requireElement('newSubtaskSummary').focus();
       }
     }
     function addSubtask() {
-      const summary = document.getElementById('newSubtaskSummary').value.trim();
-      const priority = document.getElementById('newSubtaskPriority').value;
-      const assignee = document.getElementById('newSubtaskAssignee').value.trim();
+      const summary = requireElement('newSubtaskSummary').value.trim();
+      const priority = requireElement('newSubtaskPriority').value;
+      const assignee = requireElement('newSubtaskAssignee').value.trim();
       if (!summary) {
-        document.getElementById('newSubtaskSummary').focus();
+        requireElement('newSubtaskSummary').focus();
         return;
       }
       vscode.postMessage({ command: 'addSubtask', issueKey, summary, priority: priority || undefined, assignee: assignee || undefined });
     }
     function showSubtaskEdit(key) {
-      document.getElementById('st-edit-' + key).style.display = 'block';
-      document.querySelector('#st-' + key + ' .subtask-summary-row').style.display = 'none';
-      const input = document.getElementById('st-input-' + key);
+      requireElement('st-edit-' + key).style.display = 'block';
+      const row = document.querySelector('#st-' + key + ' .subtask-summary-row');
+      if (row) { row.style.display = 'none'; }
+      const input = requireElement('st-input-' + key);
       input.focus();
       input.select();
     }
     function cancelSubtaskEdit(key) {
-      document.getElementById('st-edit-' + key).style.display = 'none';
-      document.querySelector('#st-' + key + ' .subtask-summary-row').style.display = 'flex';
+      requireElement('st-edit-' + key).style.display = 'none';
+      const row = document.querySelector('#st-' + key + ' .subtask-summary-row');
+      if (row) { row.style.display = 'flex'; }
     }
     function saveSubtaskEdit(key) {
-      const summary = document.getElementById('st-input-' + key).value.trim();
+      const summary = requireElement('st-input-' + key).value.trim();
       if (summary) {
         vscode.postMessage({ command: 'editSubtaskSummary', subtaskKey: key, summary });
       }
@@ -852,27 +1183,100 @@ export class IssueDetailPanel {
     function openSubtask(key) {
       vscode.postMessage({ command: 'openSubtask', subtaskKey: key });
     }
+    function updateSubtaskStatus(key) {
+      vscode.postMessage({ command: 'updateSubtaskStatus', subtaskKey: key });
+    }
+    function assignSubtaskToMe(key) {
+      vscode.postMessage({ command: 'assignSubtaskToMe', subtaskKey: key });
+    }
+    function openIssue(key) {
+      vscode.postMessage({ command: 'openIssue', issueKey: key });
+    }
 
     // Comments
     function addComment() {
-      const body = document.getElementById('commentBody').value.trim();
+      const body = requireElement('commentBody').value.trim();
       if (body) {
         vscode.postMessage({ command: 'addComment', issueKey, body });
-        document.getElementById('commentBody').value = '';
+        requireElement('commentBody').value = '';
       }
     }
+
+    document.addEventListener('click', (event) => {
+      const target = event.target.closest('[data-action]');
+      if (!target) { return; }
+
+      const action = target.dataset.action;
+      const subtaskKey = target.dataset.subtaskKey;
+      switch (action) {
+        case 'showSummaryEdit':
+          showSummaryEdit();
+          break;
+        case 'saveSummary':
+          saveSummary();
+          break;
+        case 'cancelSummaryEdit':
+          cancelSummaryEdit();
+          break;
+        case 'changeStatus':
+          changeStatus();
+          break;
+        case 'showDescEdit':
+          showDescEdit();
+          break;
+        case 'saveDescription':
+          saveDescription();
+          break;
+        case 'cancelDescEdit':
+          cancelDescEdit();
+          break;
+        case 'adjustStoryPoints':
+          adjustStoryPoints(Number(target.dataset.delta || 0));
+          break;
+        case 'toggleAddSubtaskForm':
+          toggleAddSubtaskForm();
+          break;
+        case 'addSubtask':
+          addSubtask();
+          break;
+        case 'showSubtaskEdit':
+          if (subtaskKey) { showSubtaskEdit(subtaskKey); }
+          break;
+        case 'saveSubtaskEdit':
+          if (subtaskKey) { saveSubtaskEdit(subtaskKey); }
+          break;
+        case 'cancelSubtaskEdit':
+          if (subtaskKey) { cancelSubtaskEdit(subtaskKey); }
+          break;
+        case 'deleteSubtask':
+          if (subtaskKey) { deleteSubtask(subtaskKey); }
+          break;
+        case 'openSubtask':
+          if (subtaskKey) { openSubtask(subtaskKey); }
+          break;
+        case 'updateSubtaskStatus':
+          if (subtaskKey) { updateSubtaskStatus(subtaskKey); }
+          break;
+        case 'assignSubtaskToMe':
+          if (subtaskKey) { assignSubtaskToMe(subtaskKey); }
+          break;
+        case 'openIssue':
+          if (target.dataset.issueKey) { openIssue(target.dataset.issueKey); }
+          break;
+        case 'addComment':
+          addComment();
+          break;
+      }
+    });
+
+    document.addEventListener('change', (event) => {
+      const target = event.target.closest('[data-action="toggleSubtask"]');
+      if (!target) { return; }
+      toggleSubtask(target.dataset.subtaskKey, target.checked);
+    });
   </script>
 </body>
 </html>`;
-  }
-
-  private escapeHtml(text: string): string {
-    return text
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
   }
 
   private dispose() {

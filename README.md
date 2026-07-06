@@ -11,6 +11,8 @@ A VS Code extension that provides a dedicated sidebar panel for managing Jira ti
 - **Close Issues** — Quickly close/resolve tickets
 - **Issue Details** — Rich webview showing full issue details, comments, and edit capabilities
 - **Add Comments** — Comment on issues directly from VS Code
+- **Sprint Progress** — Track assigned sprint points and completed sprint progress
+- **Point Controls** — Increment or decrement story points from the sidebar or issue detail panel
 
 ## Setup
 
@@ -30,9 +32,12 @@ Settings can also be configured in VS Code settings:
 {
   "jira.baseUrl": "https://your-domain.atlassian.net",
   "jira.username": "your-email@example.com",
-  "jira.project": "PROJ"
+  "jira.project": "PROJ",
+  "jira.storyPointsField": ""
 }
 ```
+
+`jira.storyPointsField` can usually be left blank. The extension auto-detects common Jira fields like `Story Points` and `Story point estimate`. If your Jira instance uses a custom or renamed field, set it to the exact Jira field id, for example `customfield_10016`.
 
 The API token is stored securely in VS Code's secret storage.
 

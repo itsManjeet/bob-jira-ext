@@ -2,6 +2,7 @@ export interface JiraIssue {
   key: string;
   id: string;
   fields: {
+    [fieldId: string]: unknown;
     summary: string;
     status: {
       name: string;
@@ -30,6 +31,14 @@ export interface JiraIssue {
       key: string;
       name: string;
     };
+    parent?: {
+      key: string;
+      fields?: {
+        summary?: string;
+        status?: { name: string; id?: string };
+        issuetype?: { name: string; iconUrl?: string };
+      };
+    };
     labels: string[];
     story_points?: number;
     customfield_10016?: number;
@@ -46,6 +55,7 @@ export interface JiraSubtask {
   id: string;
   key: string;
   fields: {
+    [fieldId: string]: unknown;
     summary: string;
     status: {
       name: string;
@@ -56,7 +66,8 @@ export interface JiraSubtask {
     };
     assignee: {
       displayName: string;
-      name: string;
+      name?: string;
+      emailAddress?: string;
       accountId?: string;
     } | null;
   };
@@ -76,6 +87,7 @@ export interface SprintInfo {
   endDate: string;
   pointsCompleted: number;
   pointsTotal: number;
+  issueCount: number;
 }
 
 export interface JiraComment {

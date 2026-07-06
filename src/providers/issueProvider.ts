@@ -1,11 +1,13 @@
 import * as vscode from 'vscode';
 import { JiraIssue, SprintInfo } from '../models/jiraTypes';
 import { JiraService } from '../services/jiraService';
+import { escapeAttribute, escapeHtml, getNonce, getWebviewCsp } from '../utils/webview';
 
 export class JiraIssueProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'jiraIssues';
 
   private _view?: vscode.WebviewView;
+  private refreshVersion = 0;
 
   constructor(private jiraService: JiraService) {}
 
@@ -40,15 +42,21 @@ export class JiraIssueProvider implements vscode.WebviewViewProvider {
   async refresh() {
     if (!this._view) { return; }
 
+    const refreshVersion = ++this.refreshVersion;
+
     if (!this.jiraService.isConfigured()) {
       this._view.webview.html = this.getNotConfiguredHtml();
       return;
     }
 
+    this._view.webview.html = this.getLoadingHtml();
+
     try {
       const { issues, sprint } = await this.jiraService.getSprintData();
+      if (refreshVersion !== this.refreshVersion || !this._view) { return; }
       this._view.webview.html = this.getHtml(issues, issues.length > 0 ? sprint : null);
     } catch (error) {
+      if (refreshVersion !== this.refreshVersion || !this._view) { return; }
       const message = error instanceof Error ? error.message : 'Unknown error';
       this._view.webview.html = this.getErrorHtml(message);
     }
@@ -79,61 +87,72 @@ export class JiraIssueProvider implements vscode.WebviewViewProvider {
   }
 
   private getSprintHeaderHtml(sprint: SprintInfo): string {
-    const pct = sprint.pointsTotal > 0 ? Math.round((sprint.pointsCompleted / sprint.pointsTotal) * 100) : 0;
+    const pct = sprint.pointsTotal > 0
+      ? Math.min(100, Math.round((sprint.pointsCompleted / sprint.pointsTotal) * 100))
+      : 0;
 
-    let metaParts: string[] = [];
+    const metaParts: string[] = [];
     if (sprint.daysLeft >= 0) {
       metaParts.push(`<span class="sprint-days">${sprint.daysLeft === 1 ? '1 day left' : `${sprint.daysLeft} days left`}</span>`);
     }
     if (sprint.endDate) {
-      metaParts.push(`<span class="sprint-end">ends ${new Date(sprint.endDate).toLocaleDateString()}</span>`);
+      metaParts.push(`<span class="sprint-end">ends ${escapeHtml(new Date(sprint.endDate).toLocaleDateString())}</span>`);
     }
     const metaHtml = metaParts.join('<span class="sprint-sep">·</span>');
 
     return `
       <div class="sprint-header">
-        <div class="sprint-name">${this.escapeHtml(sprint.name)}</div>
+        <div class="sprint-name">${escapeHtml(sprint.name)}</div>
         ${metaHtml ? `<div class="sprint-meta">${metaHtml}</div>` : ''}
         <div class="sprint-progress">
           <div class="progress-bar">
             <div class="progress-fill" style="width: ${pct}%;"></div>
           </div>
-          <div class="progress-label">${sprint.pointsCompleted} / ${sprint.pointsTotal} pts completed</div>
+          <div class="progress-label">
+            ${escapeHtml(sprint.pointsCompleted)} / ${escapeHtml(sprint.pointsTotal)} pts completed (${escapeHtml(pct)}%)
+            <span class="sprint-sep">·</span>
+            ${escapeHtml(sprint.pointsTotal)} pts assigned
+          </div>
         </div>
       </div>`;
   }
 
   private getHtml(issues: JiraIssue[], sprint: SprintInfo | null): string {
+    if (!this._view) { return ''; }
+
+    const nonce = getNonce();
+    const csp = getWebviewCsp(this._view.webview, nonce);
     const cards = issues.map((issue) => {
       const status = this.getStatusIcon(issue.fields.status.name);
       const priority = this.getPriorityIcon(issue.fields.priority.name);
       const pts = this.jiraService.getStoryPoints(issue);
-      const ptsLabel = pts > 0 ? `<span class="pts">${pts} pts</span>` : '';
       return `
-        <div class="card" onclick="openIssue('${issue.key}')">
-          <div class="card-icon" style="color: ${status.color};">${status.icon}</div>
-          <div class="card-content">
-            <div class="card-title">${this.escapeHtml(issue.fields.summary)}</div>
-            <div class="card-subtitle">
-              <span class="key">${issue.key}</span>
-              <span class="sep">·</span>
-              <span class="type">${issue.fields.issuetype.name}</span>
-              <span class="sep">·</span>
-              <span class="priority">${priority} ${issue.fields.priority.name}</span>
-              <span class="sep">·</span>
-              <span class="status">${issue.fields.status.name}</span>
-              ${ptsLabel}
+        <div class="card" role="button" tabindex="0" data-command="openIssue" data-issue-key="${escapeAttribute(issue.key)}">
+          <div class="card-head">
+            <span class="issue-key">${escapeHtml(issue.key)}</span>
+            <span class="issue-type">${escapeHtml(issue.fields.issuetype.name)}</span>
+          </div>
+          <div class="card-title">${escapeHtml(issue.fields.summary)}</div>
+          <div class="card-footer">
+            <div class="card-meta">
+              <span class="meta-pill priority-pill">${escapeHtml(priority)} ${escapeHtml(issue.fields.priority.name)}</span>
+              <span class="meta-pill status-pill">
+                <span class="status-dot" style="background:${status.color};"></span>
+                ${escapeHtml(issue.fields.status.name)}
+              </span>
             </div>
+            <span class="pts-badge" title="Sprint points assigned">${escapeHtml(pts)} pts</span>
           </div>
         </div>`;
     }).join('');
 
-    const headerHtml = sprint ? this.getSprintHeaderHtml(sprint) : '';
+    const headerHtml = sprint && sprint.issueCount > 0 ? this.getSprintHeaderHtml(sprint) : '';
 
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
     body {
@@ -144,55 +163,131 @@ export class JiraIssueProvider implements vscode.WebviewViewProvider {
       color: var(--vscode-foreground);
       background: var(--vscode-sideBar-background);
     }
+    * { box-sizing: border-box; }
     .card {
       display: flex;
-      align-items: flex-start;
-      gap: 10px;
-      padding: 10px 12px;
-      margin-bottom: 6px;
-      background: var(--vscode-editorWidget-background);
-      border: 1px solid var(--vscode-widget-border, transparent);
-      border-radius: 6px;
+      flex-direction: column;
+      gap: 8px;
+      width: 100%;
+      padding: 12px;
+      margin-bottom: 8px;
+      background: color-mix(in srgb, var(--vscode-editorWidget-background) 90%, transparent);
+      border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.2));
+      border-radius: 10px;
+      color: inherit;
       cursor: pointer;
-      transition: background 0.1s;
+      font: inherit;
+      text-align: left;
+      transition: border-color 0.12s ease, background 0.12s ease, transform 0.12s ease;
+      overflow: hidden;
     }
     .card:hover {
       background: var(--vscode-list-hoverBackground);
+      border-color: var(--vscode-focusBorder);
+      transform: translateY(-1px);
     }
-    .card-icon {
-      font-size: 18px;
-      line-height: 1;
-      flex-shrink: 0;
-      margin-top: 2px;
+    .card:focus-visible {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 1px;
     }
-    .card-content {
-      flex: 1;
+    .card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
       min-width: 0;
     }
+    .issue-key {
+      display: inline-flex;
+      align-items: center;
+      min-width: 0;
+      max-width: 55%;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .issue-type {
+      color: var(--vscode-descriptionForeground);
+      font-size: 11px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     .card-title {
+      display: -webkit-box;
       font-weight: 600;
       font-size: 13px;
-      line-height: 1.3;
-      margin-bottom: 3px;
+      line-height: 1.35;
       color: var(--vscode-foreground);
       overflow: hidden;
       text-overflow: ellipsis;
-      display: -webkit-box;
       -webkit-line-clamp: 2;
       -webkit-box-orient: vertical;
+      min-height: calc(1.35em * 2);
     }
-    .card-subtitle {
-      font-size: 11px;
+    .card-footer {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 8px;
+      min-width: 0;
+      flex-wrap: wrap;
+    }
+    .card-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      min-width: 0;
+      flex: 1;
+    }
+    .meta-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      max-width: 100%;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.2));
+      background: color-mix(in srgb, var(--vscode-editorWidget-background) 60%, transparent);
       color: var(--vscode-descriptionForeground);
-      line-height: 1.4;
+      font-size: 10px;
+      line-height: 1.5;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
-    .card-subtitle .key {
-      font-weight: 600;
-      color: var(--vscode-textLink-foreground);
+    .status-pill {
+      color: var(--vscode-foreground);
     }
-    .card-subtitle .sep {
-      margin: 0 4px;
-      opacity: 0.5;
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .pts-badge {
+      min-width: 54px;
+      height: 24px;
+      padding: 0 10px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      margin-left: auto;
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
     }
     .empty {
       text-align: center;
@@ -220,7 +315,6 @@ export class JiraIssueProvider implements vscode.WebviewViewProvider {
     }
     .sprint-sep { margin: 0 4px; opacity: 0.5; }
     .sprint-days { font-weight: 600; }
-    .sprint-progress { }
     .progress-bar {
       height: 6px;
       background: var(--vscode-progressBar-background, #333);
@@ -238,35 +332,79 @@ export class JiraIssueProvider implements vscode.WebviewViewProvider {
       font-size: 11px;
       color: var(--vscode-descriptionForeground);
     }
-    .card-subtitle .pts {
-      margin-left: 6px;
-      padding: 1px 5px;
-      background: var(--vscode-badge-background);
-      color: var(--vscode-badge-foreground);
-      border-radius: 8px;
-      font-size: 10px;
-      font-weight: 600;
-    }
   </style>
 </head>
 <body>
   ${headerHtml}
   ${issues.length > 0 ? cards : '<div class="empty"><p>No issues found</p><p>Issues assigned to you will appear here</p></div>'}
-  <script>
+  <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    function openIssue(key) {
-      vscode.postMessage({ command: 'openIssue', issueKey: key });
-    }
+    document.addEventListener('click', (event) => {
+      const target = event.target.closest('[data-command]');
+      if (!target) { return; }
+      const command = target.dataset.command;
+      if (command === 'openIssue') {
+        vscode.postMessage({ command: 'openIssue', issueKey: target.dataset.issueKey });
+      }
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') { return; }
+      const target = event.target.closest('[data-command="openIssue"]');
+      if (!target || event.target.closest('button')) { return; }
+      event.preventDefault();
+      vscode.postMessage({ command: 'openIssue', issueKey: target.dataset.issueKey });
+    });
   </script>
 </body>
 </html>`;
   }
 
-  private getNotConfiguredHtml(): string {
+  private getLoadingHtml(): string {
+    if (!this._view) { return ''; }
+
+    const nonce = getNonce();
+    const csp = getWebviewCsp(this._view.webview, nonce);
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {
+      margin: 0;
+      padding: 16px;
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size);
+      color: var(--vscode-descriptionForeground);
+      background: var(--vscode-sideBar-background);
+    }
+    .loading-card {
+      padding: 12px;
+      border-radius: 6px;
+      background: var(--vscode-editorWidget-background);
+      border: 1px solid var(--vscode-widget-border, transparent);
+    }
+  </style>
+</head>
+<body>
+  <div class="loading-card">Loading Jira issues…</div>
+</body>
+</html>`;
+  }
+
+  private getNotConfiguredHtml(): string {
+    if (!this._view) { return ''; }
+
+    const nonce = getNonce();
+    const csp = getWebviewCsp(this._view.webview, nonce);
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
     * { box-sizing: border-box; }
@@ -390,24 +528,30 @@ export class JiraIssueProvider implements vscode.WebviewViewProvider {
     </li>
   </ul>
 
-  <button class="configure-btn" onclick="configure()">Configure Jira Connection</button>
+  <button class="configure-btn" type="button" data-command="configure">Configure Jira Connection</button>
   <div class="hint">Or run <code>Jira: Configure Jira Connection</code> from the Command Palette</div>
 
-  <script>
+  <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    function configure() {
+    document.querySelector('[data-command="configure"]').addEventListener('click', () => {
       vscode.postMessage({ command: 'configure' });
-    }
+    });
   </script>
 </body>
 </html>`;
   }
 
   private getErrorHtml(message: string): string {
+    if (!this._view) { return ''; }
+
+    const nonce = getNonce();
+    const csp = getWebviewCsp(this._view.webview, nonce);
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}">
   <style>
     body {
       margin: 0; padding: 24px;
@@ -424,19 +568,15 @@ export class JiraIssueProvider implements vscode.WebviewViewProvider {
   </style>
 </head>
 <body>
-  <p class="error">${this.escapeHtml(message)}</p>
-  <button onclick="vscode.postMessage({command:'refresh'})">Retry</button>
-  <script>const vscode = acquireVsCodeApi();</script>
+  <p class="error">${escapeHtml(message)}</p>
+  <button type="button" data-command="refresh">Retry</button>
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+    document.querySelector('[data-command="refresh"]').addEventListener('click', () => {
+      vscode.postMessage({ command: 'refresh' });
+    });
+  </script>
 </body>
 </html>`;
-  }
-
-  private escapeHtml(text: string): string {
-    return text
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
   }
 }

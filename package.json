@@ -2,7 +2,7 @@
   "name": "bob-jira-ext",
   "displayName": "Jira Manager",
   "description": "Manage Jira tickets directly from VS Code - view, create, update, and close issues",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "bob",
   "engines": {
     "vscode": "^1.85.0"
@@ -99,8 +99,8 @@
         },
         "jira.storyPointsField": {
           "type": "string",
-          "default": "story_points",
-          "description": "Custom field name for story points (e.g., story_points, customfield_10016, customfield_10028)"
+          "default": "",
+          "description": "Story points field id or exact Jira field name. Leave blank to auto-detect, or set a custom field id such as customfield_10016."
         }
       }
     }
@@ -119,8 +119,5 @@
     "@typescript-eslint/parser": "^6.13.0",
     "eslint": "^8.54.0",
     "typescript": "^5.3.2"
-  },
-  "dependencies": {
-    "node-fetch": "^2.7.0"
   }
 }

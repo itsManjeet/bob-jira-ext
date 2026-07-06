@@ -119,13 +119,20 @@ export function registerCommands(
         ignoreFocusOut: true,
       });
 
+      const normalizedBaseUrl = JiraService.normalizeBaseUrl(baseUrl);
+      const baseUrlError = JiraService.validateBaseUrl(normalizedBaseUrl);
+      if (baseUrlError) {
+        vscode.window.showErrorMessage(baseUrlError);
+        return;
+      }
+
       const config = vscode.workspace.getConfiguration('jira');
-      await config.update('baseUrl', baseUrl, vscode.ConfigurationTarget.Global);
-      await config.update('username', username, vscode.ConfigurationTarget.Global);
-      await config.update('project', project, vscode.ConfigurationTarget.Global);
+      await config.update('baseUrl', normalizedBaseUrl, vscode.ConfigurationTarget.Global);
+      await config.update('username', username.trim(), vscode.ConfigurationTarget.Global);
+      await config.update('project', project.trim(), vscode.ConfigurationTarget.Global);
 
       if (token) {
-        await context.secrets.store('jira.apiToken', token);
+        await context.secrets.store('jira.apiToken', token.trim());
       }
 
       vscode.window.showInformationMessage('Jira configuration saved!');

@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { JiraService } from '../services/jiraService';
+import { escapeAttribute, getNonce, getWebviewCsp } from '../utils/webview';
 
 export class CreateIssuePanel {
   private static currentPanel: CreateIssuePanel | undefined;
@@ -42,16 +43,25 @@ export class CreateIssuePanel {
     CreateIssuePanel.currentPanel = new CreateIssuePanel(panel, jiraService);
   }
 
-  private async handleCreate(message: any) {
+  private async handleCreate(message: { project?: string; summary?: string; description?: string; issueType?: string; priority?: string; labels?: string }) {
+    const project = message.project?.trim();
+    const summary = message.summary?.trim();
+    const issueType = message.issueType?.trim();
+
+    if (!project || !summary || !issueType) {
+      vscode.window.showErrorMessage('Project, issue type, and summary are required.');
+      return;
+    }
+
     try {
       const result = await this.jiraService.createIssue({
         fields: {
-          project: { key: message.project },
-          summary: message.summary,
-          description: message.description || undefined,
-          issuetype: { name: message.issueType },
-          priority: message.priority ? { name: message.priority } : undefined,
-          labels: message.labels ? message.labels.split(',').map((l: string) => l.trim()).filter(Boolean) : undefined,
+          project: { key: project },
+          summary,
+          description: message.description?.trim() || undefined,
+          issuetype: { name: issueType },
+          priority: message.priority?.trim() ? { name: message.priority.trim() } : undefined,
+          labels: message.labels ? message.labels.split(',').map((label: string) => label.trim()).filter(Boolean) : undefined,
         },
       });
       vscode.window.showInformationMessage(`Issue ${result.key} created successfully!`);
@@ -66,11 +76,14 @@ export class CreateIssuePanel {
   private update() {
     const config = vscode.workspace.getConfiguration('jira');
     const defaultProject = config.get<string>('project', '');
+    const nonce = getNonce();
+    const csp = getWebviewCsp(this.panel.webview, nonce);
 
     this.panel.webview.html = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
     body {
@@ -121,7 +134,7 @@ export class CreateIssuePanel {
 
   <div class="field">
     <label class="required">Project Key</label>
-    <input type="text" id="project" value="${defaultProject}" placeholder="e.g., PROJ" />
+    <input type="text" id="project" value="${escapeAttribute(defaultProject)}" placeholder="e.g., PROJ" />
   </div>
 
   <div class="field">
@@ -162,9 +175,9 @@ export class CreateIssuePanel {
     <input type="text" id="labels" placeholder="label1, label2" />
   </div>
 
-  <button onclick="createIssue()">Create Issue</button>
+  <button id="createIssueButton" type="button">Create Issue</button>
 
-  <script>
+  <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
 
     function createIssue() {
@@ -190,6 +203,8 @@ export class CreateIssuePanel {
         labels
       });
     }
+
+    document.getElementById('createIssueButton').addEventListener('click', createIssue);
   </script>
 </body>
 </html>`;
